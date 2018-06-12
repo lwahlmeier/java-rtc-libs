@@ -2,33 +2,42 @@ package me.lcw.rtc.stun;
 
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
-import java.security.InvalidKeyException;
-import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.zip.CRC32;
-
-import javax.crypto.Mac;
-import javax.crypto.spec.SecretKeySpec;
 
 public class StunPacketBuilder {
-  private MessageType type;
+  private StunMessageType type;
   private TransactionID tid;
   private List<StunAttribute> attribs = new ArrayList<>();
   private List<ByteBuffer> attribBuffers = new ArrayList<>();
+  private byte padding = 0x0;
+  private boolean fingerprint = false;
+  private byte[] key = null;
 
   public StunPacketBuilder() {
-    this.type = MessageType.REQUEST;
+    this.type = StunMessageType.REQUEST;
     this.tid = StunUtils.generateTxID();
   }
 
-  public StunPacketBuilder setType(final MessageType t) {
+  public StunPacketBuilder setType(final StunMessageType t) {
     this.type = t;
     return this;
   }
 
   public StunPacketBuilder setTxID(TransactionID txID) {
     this.tid = txID;
+    return this;
+  }
+
+  public StunPacketBuilder removeAttribute(StunAttribute sa) {
+    int x = attribs.indexOf(sa);
+    attribs.remove(x);
+    attribBuffers.remove(x);
+    return this;
+  }
+
+  public StunPacketBuilder setPaddingByte(byte b) {
+    padding = b;
     return this;
   }
 
@@ -48,6 +57,16 @@ public class StunPacketBuilder {
     return this;
   }
 
+  public StunPacketBuilder enableFingerPrint() {
+    fingerprint = true;
+    return this;
+  }
+
+  public StunPacketBuilder disableFingerPrint() {
+    fingerprint = false;
+    return this;
+  }
+
   public StunPacketBuilder setAttribute(StunAttribute attr, ByteBuffer bb) {
     attribs.add(attr);
     attribBuffers.add(bb.slice());
@@ -55,17 +74,13 @@ public class StunPacketBuilder {
   }
 
   public StunPacketBuilder setMappedAddress(InetSocketAddress isa) {
-    if(isa.getAddress() == null) {
-      throw new IllegalArgumentException();
+    if(isa == null || isa.getAddress() == null) {
+      throw new IllegalArgumentException("Address can not be null!");
     }
     return setMappedAddress(isa.getAddress().getAddress(), isa.getPort());
   }
 
   public StunPacketBuilder setMappedAddress(byte[] ip, int port) {
-    return setMappedAddress(ByteBuffer.wrap(ip).getInt(), port);
-  }
-
-  public StunPacketBuilder setMappedAddress(int ip, int port) {
     if(port > Short.MAX_VALUE*2) {
       throw new IllegalArgumentException("BadPort number!");
     }
@@ -83,24 +98,26 @@ public class StunPacketBuilder {
 
     ByteBuffer bb = ByteBuffer.allocate(8);
     bb.put((byte)0); // reserved
-    bb.put((byte)1); // ipv4
+    if(ip.length == 16) {
+      bb.put((byte)2); // ipv6
+    } else {
+      bb.put((byte)1); // ipv4
+    }
     bb.putShort((short)(port));
-    bb.putInt(ip);
+    bb.put(ip);
     bb.position(0);
     setAttribute(StunAttribute.MAPPED_ADDRESS, bb);
     return this;
-
   }
+
   public StunPacketBuilder setXorMappedAddress(InetSocketAddress isa) {
-    if(isa.getAddress() == null) {
-      throw new IllegalArgumentException();
+    if(isa == null || isa.getAddress() == null) {
+      throw new IllegalArgumentException("Address can not be null!");
     }
     return setXorMappedAddress(isa.getAddress().getAddress(), isa.getPort());
   }
+
   public StunPacketBuilder setXorMappedAddress(byte[] ip, int port) {
-    return setXorMappedAddress(ByteBuffer.wrap(ip).getInt(), port);
-  }
-  public StunPacketBuilder setXorMappedAddress(int ip, int port) {
     if(port > Short.MAX_VALUE*2) {
       throw new IllegalArgumentException("BadPort number!");
     }
@@ -116,11 +133,15 @@ public class StunPacketBuilder {
       attribBuffers.remove(pos);
     }
 
-    ByteBuffer bb = ByteBuffer.allocate(8);
+    ByteBuffer bb = ByteBuffer.allocate(2+ip.length+2);
     bb.put((byte)0); // reserved
-    bb.put((byte)1); // ipv4
+    if(ip.length == 16) {
+      bb.put((byte)2); // ipv6
+    } else {
+      bb.put((byte)1); // ipv4
+    }
     bb.putShort((short)(port ^ StunUtils.STUN_SHORT_MAGIC));
-    bb.putInt(ip ^ StunUtils.STUN_MAGIC);
+    bb.put(StunUtils.unmaskAddress(this.tid, ip));
     bb.position(0);
     setAttribute(StunAttribute.XOR_MAPPED_ADDRESS, bb);
     return this;
@@ -130,37 +151,13 @@ public class StunPacketBuilder {
     setAttribute(StunAttribute.USERNAME, username);
     return this;
   }
-
-  public StunPacket buildSigned(ByteBuffer key) {
-    try {
-      SecretKeySpec signingKey = new SecretKeySpec(key.array(), key.arrayOffset() + key.position(), key.limit() - key.position(), "HmacSHA1");
-      Mac mac = Mac.getInstance("HmacSHA1");
-      mac.init(signingKey);
-      ByteBuffer obb = build().getBytes();
-      ByteBuffer nbb = ByteBuffer.allocate(obb.remaining() + 24 + 8);
-      nbb.put(obb);
-
-      mac.update(StunUtils.BBToBA(obb));
-      nbb.putShort((short)StunAttribute.MESSAGE_INTEGRITY.bits);
-      nbb.putShort((short)mac.getMacLength());
-      nbb.put(mac.doFinal());
-
-      CRC32 crc = new CRC32();
-      crc.update(nbb.array(), nbb.arrayOffset(), nbb.position());
-
-      nbb.putShort((short)StunAttribute.FINGERPRINT.bits);
-      nbb.putShort((short)4);
-      nbb.putInt(0x5354554e ^ (int)crc.getValue());
-      nbb.putShort(2, (short)(nbb.position() - 20));
-      nbb.flip();
-      return new StunPacket(nbb);
-    } catch(NoSuchAlgorithmException|InvalidKeyException e) {
-      throw new IllegalStateException(e);
-    }
-
+  
+  public StunPacketBuilder setKey(byte[] ba) {
+    key = ba;
+    return this;
   }
 
-  public StunPacket build() {
+  public StunPacket build() throws StunProtocolException {
     int size = 20;
     for(ByteBuffer bb: attribBuffers) {
       size += bb.remaining() + 4;
@@ -173,10 +170,17 @@ public class StunPacketBuilder {
       bb.putShort((short)attribBuffers.get(i).remaining());
       bb.put(attribBuffers.get(i).duplicate());
       while((bb.position() & 3) != 0) {
-        bb.put((byte)0);
+        bb.put(padding);
       }
     }
     bb.flip();
-    return new StunPacket(bb);
+    if(key != null) {
+      bb = StunUtils.addMessageIntegerity(new StunPacket(bb), key).getBytes();
+    }
+    if(this.fingerprint) {
+      return StunUtils.addFingerPrint(new StunPacket(bb));
+    } else {
+      return new StunPacket(bb);
+    }
   }
 }
